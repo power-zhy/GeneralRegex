@@ -1,4 +1,27 @@
-﻿using System;
+﻿/* *
+ * 
+ * Copyright (c) 2012  by Hongyu Zhao <power.zju.zhy@gmail.com>
+ * 
+ * 
+ * This file is part of GeneralRegex.
+ * 
+ * GeneralRegex is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Lesser General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ * 
+ * GeneralRegex is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ * 
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with GeneralRegex.  If not, see <http://www.gnu.org/licenses/>.
+ * 
+ * */
+
+
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -13,8 +36,8 @@ namespace GeneralRegex
         None = 0,
         //MatchStart = 1,
         //MatchEnd = 2,
-        Reverse = 4,
-        Posix = 8,
+        Reverse = 4,    // TODO
+        Posix = 8,      // TODO
         AllContainNull = 16,
     }
 
@@ -236,7 +259,7 @@ namespace GeneralRegex
                             }
                             catch (SerializationException)
                             {
-                                throw new FormatException(string.Format("Syntax error at index {0}: Invalid JSON data.", basePos + curr));
+                                throw new FormatException(string.Format("Syntax error at index {0}: Invalid JSON data '{1}'", basePos + curr, pattern.Substring(curr, end - curr)));
                             }
                         }
                         else
@@ -505,8 +528,10 @@ namespace GeneralRegex
 
         T[] input;
         Func<string, T, bool> comparer;
+        RegexOption option;
         Match<T> match;
         Stack<RollbackNode<T>> status;
+        int position;
 
         // currPos is the count from starting point(input.Length-1 when Reverse option is set), not the index of input data
         private T GetObj(int currPos, RegexOption option, int offset = 0)
@@ -552,6 +577,18 @@ namespace GeneralRegex
             }
         }
 
+        private void ResetNode(RegexNode<T> node)
+        {
+            node.matchChild = null;
+            node.matchRepeat = 0;
+            RegexNode<T> child = node.children;
+            while (child != null)
+            {
+                ResetNode(child);
+                child = child.next;
+            }
+        }
+
         // match a node without caring about quantifiers
         // return how much objects matched by node, -1 for errors
         // position is the count from starting point(input.Length-1 when Reverse option is set), not the index of input data
@@ -590,7 +627,7 @@ namespace GeneralRegex
                     else
                         return GetObj(curr, option) == null ? -1 : 1;
                 case RegexNodeType.Unit:
-                    return comparer(node.strData, GetObj(curr, option)) ? 1 : -1;
+                    return comparer(node.strData.Substring(1), GetObj(curr, option)) ? 1 : -1;
                 case RegexNodeType.Json:
                     T obj = GetObj(curr, option);
                     if (node.objData == null)
@@ -622,6 +659,7 @@ namespace GeneralRegex
                                 if (step > 0)   // will not match more when step == 0
                                 {
                                     node.matchRepeat++;
+                                    curr += step;
                                     if (node.repeatMax < 0 || node.matchRepeat < node.repeatMax)
                                         PushStatus(new RollbackNode<T>(RollbackNodeType.NoGreedyMatch, node, curr));
                                 }
@@ -667,13 +705,17 @@ namespace GeneralRegex
                                     if (!node.noBack)
                                         PushStatus(new RollbackNode<T>(RollbackNodeType.GreedyMatch, node, curr));
                                     step = MatchNode(child, curr, null, option);
-                                    if (step > 0)
+                                    if (step > 0)   // will not match more when step == 0
                                     {
                                         matchLen += step;
                                         curr += step;
                                         node.matchRepeat++;
                                         if (node.repeatMax >= 0 && node.matchRepeat >= node.repeatMax)
                                             return matchLen;
+                                    }
+                                    else if (step == 0)
+                                    {
+                                        return matchLen;
                                     }
                                     else
                                     {
@@ -800,16 +842,17 @@ namespace GeneralRegex
                         step = MatchNode(child, curr, null, option);
                     return step >= 0 ? -1 : 0;
                 case RegexNodeType.CreateGroup:
-                    step = MatchNode(node, curr, rollback, option);
+                    step = MatchNode(child, curr, rollback, option);
                     if (step >= 0)
                     {
                         int start = (option & RegexOption.Reverse) != 0 ? input.Length - curr - step : curr;
                         Capture<T> capture = new Capture<T>(input, start, step);
-                        PushStatus(new RollbackNode<T>(RollbackNodeType.CreateGroup, node, curr));
+                        if (!string.IsNullOrEmpty(node.closeGroup))
+                            if (match.PopGroup(node.closeGroup) == null)
+                                return -1;
                         if (!string.IsNullOrEmpty(node.groupName))
                             match.PushGroup(node.groupName, capture);
-                        if (!string.IsNullOrEmpty(node.closeGroup))
-                            match.PopGroup(node.closeGroup);
+                        PushStatus(new RollbackNode<T>(RollbackNodeType.CreateGroup, node, curr));
                     }
                     return step;
                 case RegexNodeType.MatchGroup:
@@ -846,9 +889,16 @@ namespace GeneralRegex
         {
             this.input = input.ToArray();
             this.comparer = comparer;
+            this.option = option;
+            position = 0;
+            return MatchNext();
+        }
+
+        public Match<T> MatchNext()
+        {
             match = new Match<T>();
             status = new Stack<RollbackNode<T>>();
-            int position = 0;
+            ResetNode(root);
             while (position <= this.input.Length && !match.Success)
             {
                 int length = MatchNode(root, position, null, option);
@@ -856,6 +906,7 @@ namespace GeneralRegex
                 {
                     int start = (option & RegexOption.Reverse) != 0 ? this.input.Length - position - length : position;
                     match.SetValue(input, start, length);
+                    position += (length == 0 ? 1 : length);
                 }
                 else
                     position++;
@@ -865,33 +916,12 @@ namespace GeneralRegex
 
         public Match<T>[] Matches(IEnumerable<T> input, Func<string, T, bool> comparer, RegexOption option)
         {
-            this.input = input.ToArray();
-            this.comparer = comparer;
             List<Match<T>> list = new List<Match<T>>();
-            int position = 0;
-            while (true)
+            Match<T> match = Match(input, comparer, option);
+            while (match.Success)
             {
-                match = new Match<T>();
-                status = new Stack<RollbackNode<T>>();
-                int length = 0;
-                while (position <= this.input.Length && !match.Success)
-                {
-                    length = MatchNode(root, position, null, option);
-                    if (length >= 0)
-                    {
-                        int start = (option & RegexOption.Reverse) != 0 ? this.input.Length - position - length : position;
-                        match.SetValue(input, start, length);
-                    }
-                    else
-                        position++;
-                }
-                if (match.Success)
-                {
-                    list.Add(match);
-                    position += (length <= 0 ? 1 : length);
-                }
-                else
-                    break;
+                list.Add(match);
+                match = MatchNext();
             }
             return list.ToArray();
         }
@@ -989,7 +1019,9 @@ namespace GeneralRegex
                     result = "(?>!" + result + ")";
                     break;
                 case RegexNodeType.CreateGroup:
-                    result = "(?'" + node.groupName + "'" + result + ")";
+                    string str = node.groupName != null ? node.groupName : "";
+                    str = node.closeGroup != null ? str + "-" + node.closeGroup : str;
+                    result = "(?'" + str + "'" + result + ")";
                     break;
                 case RegexNodeType.MatchGroup:
                     result = "(?=" + node.groupName + ")";
